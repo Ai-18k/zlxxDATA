@@ -391,7 +391,7 @@ class CnipaClient:
         response = requests.post(url, headers=headers, cookies=self.cookie, data=data,verify=False,timeout=(5,20))
         print("第三次获取cookies信息:", self.cookies)
         print(response)
-        with open("demo.html","w",encoding="utf-8") as f:
+        with open("zlssSpider.html","w",encoding="utf-8") as f:
             f.write(response.text)
         global rs_content
         rs_content=response.text

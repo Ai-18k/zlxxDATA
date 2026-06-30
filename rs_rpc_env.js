@@ -155,7 +155,7 @@ function guid() {
     return (S4()+S4()+"-"+S4()+"-"+S4()+"-"+S4()+"-"+S4()+S4()+S4());
 }
 // 连接服务端
-var client = new SekiroClient("ws://127.0.0.1:5620/business-demo/register?group=rs_test&clientId="+guid());
+var client = new SekiroClient("ws://127.0.0.1:5620/business-zlssSpider/register?group=rs_test&clientId="+guid());
 // 业务接口
 client.registerAction("rs_ajax",function(request, resolve, reject){
     var ts_code = request['arg']

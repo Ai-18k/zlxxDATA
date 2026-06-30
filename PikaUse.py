@@ -269,6 +269,7 @@ class MQConnectionPool:
         except Exception as e:
             logger.error(f"保存数据到MongoDB失败: {e}")
 
+
     def close(self):
         """关闭所有连接和通道"""
         with self._lock:

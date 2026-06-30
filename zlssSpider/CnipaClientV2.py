@@ -12,11 +12,98 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pymongo import errors
 from loguru import logger
+from tqdm import tqdm
+from config import Config
+import threading
+from PikaUse import MQConnectionPool
+from typing import Optional
 
 
-class Rs6Th:
+_MQ_POOL: Optional[MQConnectionPool] = None
+_MQ_POOL_LOCK = threading.Lock()
 
-    def __init__(self):
+
+def _get_mq_pool() -> MQConnectionPool:
+    """获取全局MQ连接池实例（单例模式）"""
+    global _MQ_POOL
+    if _MQ_POOL is None:
+        with _MQ_POOL_LOCK:
+            if _MQ_POOL is None:
+                _MQ_POOL = MQConnectionPool()
+    return _MQ_POOL
+
+
+def mongoToMQ(flg: int, item_info):
+    """
+    发送数据到RabbitMQ（使用全局连接池）
+
+    Args:
+        flg: 数据类型标识 (0-7)
+        item_info: 单条数据（Dict）或批量数据（List）
+    """
+    # 转换为列表格式
+    if not isinstance(item_info, list):
+        if item_info is None:
+            logger.warning(f"flg={flg} 收到None，跳过发送")
+            return
+        item_info = [item_info]
+
+    if not item_info:
+        logger.warning(f"flg={flg} 收到空列表，跳过发送")
+        return
+
+    pool = _get_mq_pool()
+
+    # 数据类型名称映射（用于日志）
+    data_type_names = {
+        0: "公司基础信息",
+        1: "行业关联数据",
+        2: "科创资质数据",
+        3: "司法数据",
+        4: "专利数据",
+        5: "许可证数据",
+        6: "资质证书数据",
+        7: "股东信息数据"
+    }
+    data_type = data_type_names.get(flg, f"类型{flg}")
+
+    try:
+        # 发送数据到MQ
+        success = pool.publish(flg, item_info)
+
+        if success:
+            # 获取第一条数据的公司名称用于日志（如果存在）
+            coms=[company["relationCompanyName"] for company in item_info]
+            logger.success(
+                f"【✅ 发送成功】"
+                f"数据类型:{data_type} | "
+                f"数量:{len(item_info)}条 | "
+                f"公司:{coms}"
+                # f"示例:{item_info}"
+            )
+        else:
+            logger.error(f"发送数据到MQ失败，数据已保存到MongoDB失败集合")
+            pool.save_to_mongodb(flg, item_info)
+
+    except Exception as e:
+        logger.error(f"mongoToMQ执行失败 (flg={flg}): {e}")
+        pool.save_to_mongodb(flg, item_info)
+
+
+def close_mq_pool():
+    """关闭全局MQ连接池（程序退出时调用）"""
+    global _MQ_POOL
+    with _MQ_POOL_LOCK:
+        if _MQ_POOL:
+            _MQ_POOL.close()
+            _MQ_POOL = None
+            logger.info("全局MQ连接池已关闭")
+
+
+class Patentspider(Config):
+
+    def __init__(self,area):
+        super().__init__(area)
         self.session = requests.Session(impersonate="chrome110")
         self.start_url = "http://epub.cnipa.gov.cn/"
     #     self.proxies = {
@@ -45,12 +132,11 @@ class Rs6Th:
             'Upgrade-Insecure-Requests': '1',
             'User-Agent': self.user_agent,
         }
-
-
-
-
-
-
+        self.zlxx_item=[]
+        self.area_key=self.serv_client[area]["filter_company_id"]
+        self.zlxx_comp_key = self.config["rkey"] + ":zlxx_id"
+        self.processed_ids = set()  # 处理过的公司ID集合
+        self.thread_local = threading.local()
 
 
     def fetch_get(self, url):
@@ -155,13 +241,13 @@ class Rs6Th:
                 token = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', resp_2.text).group(1)
                 return token, content, ts_code, js_path
 
-    def index_response(self,token, content, ts_code, js_path):
+    def index_response(self,token, content, ts_code, js_path,company):
         self.generate_cookie(content, ts_code, js_path)
         all_cookies = self.session.cookies.get_dict()
         if len(all_cookies) < 2:
             print("当前cookie数量不足2个")
         data = [
-            ('searchStr', '阿里巴巴'),
+            ('searchStr', company),
             ('fmgb', 'true'),
             ('fmsq', 'true'),
             ('xxsq', 'true'),
@@ -227,6 +313,17 @@ class Rs6Th:
         return text
 
 
+    def send_data(self, item):
+        # if "_id" in item:
+        #     del item["_id"]
+        print("记录打点:", len(self.zlxx_item))
+        self.zlxx_item.append(item)
+        if len(self.zlxx_item) >= 10:
+            mongoToMQ(4, self.zlxx_item)
+            print(f"【*】发送成功：{self.zlxx_item}")
+            self.zlxx_item.clear()
+
+
     def getpic(self,src):
         for _ in range(5):
             try:
@@ -246,6 +343,7 @@ class Rs6Th:
                     return url
             except Exception as e:
                 print(e)
+
 
     def params_data(self,html):
         items = []
@@ -426,15 +524,37 @@ class Rs6Th:
                 if page == 1:
                     items.extend(info)
                 print(items)
+                self.send_data(items)
+
+
+    def _pushcom(self, comp):
+        self.local_conn.lpush(self.comp_key, comp.decode())
+
+
+    def copydata(self,executor):
+        if not self.local_conn.exists(self.zlxx_comp_key):
+            num = self.area_key.estimated_document_count()
+            print("找到: 【", num, "】 个文档！！")
+            comps = self.area_key.find()
+            futures = []
+            _ = 1
+            for comp in tqdm(comps, desc="处理进度", leave=True):
+                self.local_conn.lpush(self.zlxx_comp_key, comp.decode())
+                futures.append(executor.submit(self._pushcom, comp))
+                _ += 1
+            for future in as_completed(futures):
+                future.result()
+            print(f"=========实际：{num}，成功导入【{_}】公司成功！！")
 
 
     def main(self):
+        token, content, ts_code, js_path = client.start_response()
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             self.copydata(executor)
             flist = []
             _ = 0
             processed_companies = set()  # 用于记录已处理的公司
-
             while True:
                 comp = self.local_conn.lpop(self.zlxx_comp_key)
                 if not comp:
@@ -448,7 +568,9 @@ class Rs6Th:
                         print(comp_name)
                         self.processed_ids.add(comp_name)
                         processed_companies.add(comp_name)  # 记录已处理的公司
-                        flist.append(executor.submit(self.spider, comp_name))
+                        totalpage, token1, content1, ts_code1, js_path1, data, lastAn, lastGgr = self.index_response(token, content, ts_code, js_path,comp_name)
+                        if token1 and content1 and ts_code1 and js_path1:
+                            flist.append(executor.submit(self.details_response,totalpage,token1, content1, ts_code1, js_path1,comp_name,data,lastAn,lastGgr,type))
                         _ += 1
                         if len(flist) >= 5:
                             for future in as_completed(flist):
@@ -464,12 +586,12 @@ class Rs6Th:
 
 
 if __name__ == "__main__":
-    client = Rs6Th()
-    # client.start_response()
-    token, content, ts_code, js_path = client.start_response()
-    totalpage,token1, content1, ts_code1, js_path1,data,lastAn,lastGgr = client.index_response(token, content, ts_code, js_path)
-    if token1 and content1 and ts_code1 and js_path1:
-        for type in [
-            # "1",
-            "3","4","6","9","10"]:
-            client.details_response(totalpage,token1, content1, ts_code1, js_path1,"阿里巴巴",data,lastAn,lastGgr,type)
+    client = Patentspider("fujian")
+    client.main()
+    # token, content, ts_code, js_path = client.start_response()
+    # totalpage,token1, content1, ts_code1, js_path1,data,lastAn,lastGgr = client.index_response(token, content, ts_code, js_path,company)
+    # if token1 and content1 and ts_code1 and js_path1:
+    #     for type in [
+    #         # "1",
+    #         "3","4","6","9","10"]:
+    #         client.details_response(totalpage,token1, content1, ts_code1, js_path1,"阿里巴巴",data,lastAn,lastGgr,type)

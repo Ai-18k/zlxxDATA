@@ -28,9 +28,7 @@ def filtermap(area):
 
 def checkconfig(area):
     filterAddr = filtermap(area)
-    with open("config.json", "r", encoding="utf-8") as file:
-        config = file.read()
-    config = json.loads(config)
+    config = {"serverAddr": ["79",6379,15,"lzh990130",150]}
     # serv_conn = Redis('139.9.70.%s' % config["serverAddr"][0],
     #                   config["serverAddr"][1],
     #                   config["serverAddr"][2],
