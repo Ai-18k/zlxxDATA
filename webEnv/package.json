@@ -1,0 +1,19 @@
+{
+  "name": "webenv",
+  "version": "1.0.0",
+  "description": "爬虫补环境工具",
+  "main": "",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^24.1.0"
+  },
+  "dependencies": {
+    "axios": "^1.14.0",
+    "cheerio": "^1.1.2",
+    "express": "^5.2.1"
+  }
+}
