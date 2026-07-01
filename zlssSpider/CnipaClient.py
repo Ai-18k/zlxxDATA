@@ -12,7 +12,7 @@ from loguru import logger
 import threading
 from PikaUse import MQConnectionPool
 from typing import Optional
-
+import json
 
 _MQ_POOL: Optional[MQConnectionPool] = None
 _MQ_POOL_LOCK = threading.Lock()
@@ -68,7 +68,7 @@ def mongoToMQ(flg: int, item_info):
 
         if success:
             # 获取第一条数据的公司名称用于日志（如果存在）
-            coms=[company["relationCompanyName"] for company in item_info]
+            coms=[company["zlOpenNum"] for company in item_info]
             logger.success(
                 f"【✅ 发送成功】"
                 f"数据类型:{data_type} | "
@@ -95,20 +95,22 @@ def close_mq_pool():
             logger.info("全局MQ连接池已关闭")
 
 
+start_url = "http://epub.cnipa.gov.cn/"
+
+
 class Patentspider():
 
     def __init__(self):
         self.session = requests.Session(impersonate="chrome110")
-        self.start_url = "http://epub.cnipa.gov.cn/"
         self.proxies = {
         'http': 'http://E2304118:C575BACB1E7D@tun-buhuph.qg.net:14358',
         'https': 'http://E2304118:C575BACB1E7D@tun-buhuph.qg.net:14358',
         # 'http': None,
         # 'https': None,
     }
-        self.index_url = self.start_url  + "Dxb/IndexQuery"  #检索页 / 首查（POST 表单）
-        self.page_url = self.start_url + "dxb/PageQuery" #分页页请求
-        self.domain = urllib.parse.urlparse(self.start_url).netloc
+        self.index_url = start_url  + "Dxb/IndexQuery"  #检索页 / 首查（POST 表单）
+        self.page_url = start_url + "dxb/PageQuery" #分页页请求
+        self.domain = urllib.parse.urlparse(start_url).netloc
         self.start_template = "env_start_template_my.js"  # 首页环境模板
         self.index_template = "env_index_tempate.js" #搜索页环境模板
         self.details_template = "env_details_tempate.js" #详情页环境模板
@@ -150,19 +152,14 @@ class Patentspider():
         js_path = js_path_list[0] if js_path_list else ""
         return content, ts_code, js_path
 
-    def start_response(self):
-        # 第一步：第一次请求，必须拿到 202 页面
-        html = self.fetch_get(self.start_url)
-        if not html:
-            return 
-            
+    def start_response(self,html):
         content, ts_code, js_path = self.extract_info(html)
         if not js_path:
             print("❌ 未提取到远程 JS 路径")
             return
 
         # 第二步：请求远程 JS 文件 (已修复 URL 拼接 Bug)
-        js_url = urllib.parse.urljoin(self.start_url, js_path)
+        js_url = urllib.parse.urljoin(start_url, js_path)
         js_resp = self.session.get(js_url, headers=self.headers)
         remote_js = js_resp.text
 
@@ -222,7 +219,7 @@ class Patentspider():
         if len(all_cookies) < 2:
             print("⚠️ 警告：当前 Cookie 数量不足2个！")
         # 第六步：用新的 Cookie 第二次请求首页，预期得到 200
-        resp_2 = self.get_page(self.start_url)
+        resp_2 = self.get_page(start_url)
         if resp_2 is not None:
             if resp_2.status_code == 200:
                 content, ts_code, js_path = self.extract_info(resp_2.text)
@@ -230,31 +227,41 @@ class Patentspider():
                 return token, content, ts_code, js_path
 
     def index_response(self,data,content, ts_code, js_path):
-        self.generate_cookie(content, ts_code, js_path)
-        all_cookies = self.session.cookies.get_dict()
-        if len(all_cookies) < 2:
-            print("当前cookie数量不足2个")
-        resp_2 = self.session.post(self.index_url,proxies=self.proxies, data=data, headers=self.headers)
-        if resp_2 is not None:
-            print(f"第二次请求状态码: {resp_2.status_code}")
-            if resp_2.status_code == 200:
-                if "抱歉，没有您要查询的结果！" in resp_2.text:
-                    return None,None,None,None,None,None,None,None,None
-                html = etree.HTML(resp_2.text)
-                jscode = html.xpath('//div[@id="result"]/script/text()')[0]
-                config = re.findall('var obj_2 = (.*?);', jscode, re.S)[0]
-                code = execjs.eval(config)
-                totalpage = int(code['total_item'])
-                if totalpage <2:
-                    return self.params_data(resp_2.text),None,None,None,None,None,None,None,None
-                content, ts_code, js_path = self.extract_info(resp_2.text)
-                lastAn,lastGgr=self.get_searchAfter(resp_2.text)
-                token = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', resp_2.text).group(1)
-                ols=html.xpath('//ol[@class="overview-menu"]//a/text()')
-                data=self.params_data(resp_2.text)
-                ## 从每页3三条数据切换每页10条数据的页数
-                totalpage = math.ceil(int(code['total_item']) * 3 / 10)
-                return totalpage,token,content, ts_code, js_path,data,ols,lastAn,lastGgr
+        for _ in range(5):
+            try:
+                self.generate_cookie(content, ts_code, js_path)
+                all_cookies = self.session.cookies.get_dict()
+                if len(all_cookies) < 2:
+                    print("当前cookie数量不足2个")
+                resp_2 = self.session.post(self.index_url,proxies=self.proxies, data=data, headers=self.headers)
+                if resp_2 is not None:
+                    print(f"第二次请求状态码: {resp_2.status_code}")
+                    if resp_2.status_code == 200:
+                        if "抱歉，没有您要查询的结果！" in resp_2.text:
+                            return None,None,None,None,None,None,None,None,None
+                        html = etree.HTML(resp_2.text)
+                        jscode = html.xpath('//div[@id="result"]/script/text()')[0]
+                        config = re.findall('var obj_2 = (.*?);', jscode, re.S)[0]
+                        code = execjs.eval(config)
+                        totalpage = int(code['total_item'])
+                        if totalpage <2:
+                            return self.params_data(resp_2.text),None,None,None,None,None,None,None,None
+                        content, ts_code, js_path = self.extract_info(resp_2.text)
+                        lastAn,lastGgr=self.get_searchAfter(resp_2.text)
+                        token = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', resp_2.text).group(1)
+                        ols=html.xpath('//ol[@class="overview-menu"]//a/text()')
+                        data=self.params_data(resp_2.text)
+                        ## 从每页3三条数据切换每页10条数据的页数
+                        totalpage = math.ceil(int(code['total_item']) * 3 / 10)
+                        return totalpage,token,content, ts_code, js_path,data,ols,lastAn,lastGgr
+                    elif resp_2.status_code == 202:
+                        token, content, ts_code, js_path=self.start_response(resp_2.text)
+                        self.generate_cookie(content, ts_code, js_path)
+                    else:
+                        print(f"index_response响应状态码{resp_2.status_code}")
+            except Exception as e:
+                print(e)
+
 
     @staticmethod
     def upload_bytes(data: bytes, filename: str = "data.jpg"):
@@ -385,7 +392,7 @@ class Patentspider():
 
 
     def generate_cookie(self,content, ts_code, js_path):
-        js_url = urllib.parse.urljoin(self.start_url, js_path)
+        js_url = urllib.parse.urljoin(start_url, js_path)
         js_resp = self.session.get(js_url, headers=self.headers)
         remote_js = js_resp.text
         try:
@@ -494,96 +501,8 @@ class Patentspider():
                 mongoToMQ(4,items)
 
 
-if __name__ == "__main__":
-    # client = Patentspider()
-    # token, content, ts_code, js_path = client.start_response()
-    # company="厦门市鑫尚华威科技有限公司"
-    # # company="泉州市八玺生物科技有限公司"
-    # # company="阿里巴巴"
-    # for company in ["厦门市鑫尚华威科技有限公司","泉州市八玺生物科技有限公司","阿里巴巴"]:
-    #     type_list={
-    #         '发明公布':1,'发明公布更正':2, '发明授权':3, '发明授权更正':4, '实用新型':6, '外观设计':9, '外观设计更正':10
-    #     }
-    #     index_type_list={
-    #               '发明公布': 1,"发明授权":2,"实用新型":3,"外观设计":4
-    #             }
-    #     params = [
-    #         ('searchStr', company),
-    #         ('fmgb', 'true'),
-    #         ('fmsq', 'true'),
-    #         ('xxsq', 'true'),
-    #         ('wgsq', 'true'),
-    #         ('trsSql', ''),
-    #         ('__RequestVerificationToken', f'{token}'),
-    #         ('fmgb', 'false'),
-    #         ('fmsq', 'false'),
-    #         ('xxsq', 'false'),
-    #         ('wgsq', 'false'),
-    #     ]
-    #     data,token1, content1, ts_code1, js_path1,item,tp,lastAn,lastGgr = client.index_response(params, content, ts_code, js_path)
-    #     if not data:
-    #         print(f"跳过！未匹配到【{company}】 专利数据！！")
-    #         continue
-    #     if token1 and content1 and ts_code1 and js_path1 and item and tp and lastAn and lastGgr:
-    #         if not isinstance(data,list):
-    #             for rge in tp:
-    #                 _type=type_list[rge]
-    #                 client.details_response(data,token1, content1, ts_code1, js_path1,company,item,lastAn,lastGgr,_type)
-    #         else:
-    #             del params[index_type_list[data["infoType"]]]
-    #             data, token1, content1, ts_code1, js_path1, item, tp, lastAn, lastGgr = client.index_response(params,content,ts_code,js_path)
-    #             if not data:
-    #                 print(f"跳过！未匹配到【{company}】 专利数据！！")
-    #                 continue
-    #             if token1 and content1 and ts_code1 and js_path1 and item and tp and lastAn and lastGgr:
-    #                 if not isinstance(data, list):
-    #                     for rge in tp:
-    #                         _type = type_list[rge]
-    #                         client.details_response(data, token1, content1, ts_code1, js_path1, company, item, lastAn,
-    #                                                 lastGgr, _type)
-    #                 else:
-    #                     params.remove(index_type_list[data["infoType"]])
-    #                     data, token1, content1, ts_code1, js_path1, item, tp, lastAn, lastGgr = client.index_response(
-    #                         params, content, ts_code, js_path)
-    #                     if not data:
-    #                         print(f"跳过！未匹配到【{company}】 专利数据！！")
-    #                         continue
-    #                     if token1 and content1 and ts_code1 and js_path1 and item and tp and lastAn and lastGgr:
-    #                         if not isinstance(data, list):
-    #                             for rge in tp:
-    #                                 _type = type_list[rge]
-    #                                 client.details_response(data, token1, content1, ts_code1, js_path1, company, item,
-    #                                                         lastAn,
-    #                                                         lastGgr, _type)
-    #                     # .
-    #                     # .
-    #                     # .
-    #                     # .
-    #                     # .
-    #                     # 直到paramsremove完
-    #     else:
-    #         mongoToMQ(4, data)
-    #         del params[index_type_list[data[0]["infoType"]]]
-    #         data, token1, content1, ts_code1, js_path1, item, tp, lastAn, lastGgr = client.index_response(params,content,ts_code,js_path)
-    #         if not data:
-    #             print(f"跳过！未匹配到【{company}】 专利数据！！")
-    #             continue
-    #         if token1 and content1 and ts_code1 and js_path1 and item and tp and lastAn and lastGgr:
-    #             if not isinstance(data, list):
-    #                 for rge in tp:
-    #                     _type = type_list[rge]
-    #                     client.details_response(data, token1, content1, ts_code1, js_path1, company, item, lastAn,
-    #                                             lastGgr, _type)
-    #         else:
-    #             mongoToMQ(4, data)
-    #             del params[index_type_list[data[0]["infoType"]]]
-    #             data, token1, content1, ts_code1, js_path1, item, tp, lastAn, lastGgr = client.index_response(params,
-    #                                                                                                           content,
-    #                                                                                                           ts_code,js_path)
-    #             if not data:
-    #                 print(f"跳过！未匹配到【{company}】 专利数据！！")
-    #                 continue
 
+if __name__ == "__main__":
     def process_company(client, company, token, content, ts_code, js_path):
         type_list = {
             '发明公布': 1,
@@ -595,12 +514,12 @@ if __name__ == "__main__":
             '外观设计更正': 10
         }
 
-        # 对应params里面true参数的位置
-        param_index = {
-            "发明公布": 1,
-            "发明授权": 2,
-            "实用新型": 3,
-            "外观设计": 4
+        # infoType 对应 params 里的检索开关字段（不能用固定下标 del，删除后索引会错位）
+        param_key = {
+            "发明公布": "fmgb",
+            "发明授权": "fmsq",
+            "实用新型": "xxsq",
+            "外观设计": "wgsq",
         }
 
         params = [
@@ -620,7 +539,7 @@ if __name__ == "__main__":
         # 已经关闭的类型
         removed = set()
 
-        while len(removed) < len(param_index):
+        while len(removed) < len(param_key):
 
             (
                 data,
@@ -680,25 +599,29 @@ if __name__ == "__main__":
             # 失败，需要关闭一个类型
             # =======================
 
-            if not success:
-                mongoToMQ(4, data)
+            info_type = data[0]["infoType"]
 
-            if isinstance(data, list):
-                info_type = data[0]["infoType"]
-            else:
-                info_type = data["infoType"]
+            if info_type not in type_list:
+                with open("未匹配到的专利类型.txt", "a", encoding="utf-8") as f:
+                    f.write(f"{company} -> {info_type}\n")
+                print(f"未知专利类型：{info_type}，已记录")
+                return
 
             if info_type in removed:
                 print(f"{info_type} 已关闭，结束")
                 return
 
+            if not success:
+                print(data)
+                mongoToMQ(4, data)
+
             removed.add(info_type)
 
-            idx = param_index[info_type]
-
-            # 防止越界
-            if idx < len(params):
-                del params[idx]
+            key = param_key[info_type]
+            for i, (k, v) in enumerate(params):
+                if k == key and v == 'true':
+                    del params[i]
+                    break
 
             print(f"关闭检索类型：{info_type}")
 
@@ -707,15 +630,25 @@ if __name__ == "__main__":
 
     client = Patentspider()
 
-    token, content, ts_code, js_path = client.start_response()
+    # 第一步：第一次请求，必须拿到 202 页面
+    html = client.fetch_get(start_url)
+    if not html:
+        raise ConnectionError("未获取有效的页面")
 
-    companies = [
-        "厦门市鑫尚华威科技有限公司",
-        "泉州市八玺生物科技有限公司",
-        "阿里巴巴"
-    ]
+    token, content, ts_code, js_path = client.start_response(html)
+
+
+    with open('company_110000.json', 'r', encoding="utf-8") as f:
+        # companies = [
+        #     "厦门市鑫尚华威科技有限公司",
+        #     "泉州市八玺生物科技有限公司",
+        #     "阿里巴巴"
+        # ]
+        companies = json.loads(f.read())
 
     for company in companies:
+        company=company['company_name']
+        print(f"正在获取【{company}】")
         process_company(
             client,
             company,
@@ -724,3 +657,4 @@ if __name__ == "__main__":
             ts_code,
             js_path
         )
+
